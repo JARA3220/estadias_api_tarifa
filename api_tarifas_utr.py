@@ -1,4 +1,29 @@
-﻿import os
+﻿#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+api_tarifas_utr.py
+==================
+API REST en FastAPI para estimar tarifas de viajes compartidos UTR.
+Recibe desde la app móvil (Flutter):
+- marca (str)
+- modelo (str)
+- anio (int | None)
+- hora (str, formato "HH:MM", de 05:00 a 18:30)
+- km_recorrido (float)
+- tiempo_estimado (float, en minutos)
+- asientos (int, 1 a 4)
+
+Si no encuentra la marca o el modelo en el catálogo, utiliza automáticamente
+el rendimiento promedio de respaldo: 10.16404059 km/L.
+
+Devuelve únicamente:
+  {"tarifa_mxn": 31}
+
+Ejecución en Render:
+    uvicorn api_tarifas_utr:app --host 0.0.0.0 --port $PORT
+"""
+
+import os
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 
 from datetime import datetime
@@ -16,25 +41,34 @@ DIR_BASE = Path(__file__).resolve().parent
 RUTA_VEHICULOS = DIR_BASE / "vehiculos_limpios_utr_filtrado.xlsx"
 RUTA_MODELO = DIR_BASE / "modelo_mlp_utr.keras"
 
+RENDIMIENTO_PROMEDIO_DEFAULT = 10.16404059
+
 FRANJAS_TRAFICO = (
-    (5 * 60 + 0, 7 * 60 + 29, 0.00, "Madrugada / tráfico ligero (0%)"),
-    (7 * 60 + 30, 10 * 60 + 30, 0.15, "Hora pico entrada matutina (+15%)"),
-    (10 * 60 + 31, 13 * 60 + 29, 0.00, "Horario valle / tráfico normal (0%)"),
-    (13 * 60 + 30, 18 * 60 + 30, 0.10, "Salida y turno vespertino (+10%)"),
+    (5 * 60 + 0, 7 * 60 + 29, 0.00),    # 05:00 - 07:29 (madrugada / tráfico ligero)
+    (7 * 60 + 30, 10 * 60 + 30, 0.15),  # 07:30 - 10:30 (hora pico entrada matutina)
+    (10 * 60 + 31, 13 * 60 + 29, 0.00), # 10:31 - 13:29 (horario valle / tráfico normal)
+    (13 * 60 + 30, 18 * 60 + 30, 0.10), # 13:30 - 18:30 (salida y turno vespertino)
 )
 
-MEDIA_PCA = np.array([11.4131, 15.0905, 20.9650, 2.3100, 0.0982], dtype=np.float64)
-DESV_PCA = np.array([3.2457, 2.8103, 4.1981, 0.9241, 0.0539], dtype=np.float64)
-W_PCA = np.array(
+# Proyección PCA calibrada para el modelo MLP entrenado con los 1,000 registros
+# Orden de entrada x: [rendimiento_km_l, distancia_km, tiempo_estimado_min, num_pasajeros, recargo_trafico]
+INTERCEPTO_PCA = np.array([-7.37980095, 0.56953824, -4.41355641, 1.15023713], dtype=np.float64)
+MATRIZ_PCA = np.array(
     [
-        [-0.0307,  0.6442, -0.7246, -0.2427],
-        [-0.6901, -0.1436, -0.0535, -0.1017],
-        [-0.7000, -0.0662, -0.0315, -0.0261],
-        [ 0.0875, -0.5811, -0.6717,  0.4508],
-        [-0.1587,  0.4714,  0.1415,  0.8526],
+        [ 0.00946661, -0.19848883,  0.22323690,  0.07476280],  # rendimiento_km_l
+        [ 0.24555475,  0.05109545,  0.01904802,  0.03617496],  # distancia_km
+        [ 0.16674485,  0.01577924,  0.00749162,  0.00621934],  # tiempo_estimado_min
+        [-0.09467618,  0.62886676,  0.72684502, -0.48779245],  # num_pasajeros
+        [ 2.94259409, -8.74012579, -2.62376024, -15.80661040], # recargo_trafico
     ],
     dtype=np.float64,
 )
+
+# Carga única en memoria al iniciar el servidor
+if not RUTA_VEHICULOS.exists():
+    raise FileNotFoundError(f"No se encontró '{RUTA_VEHICULOS.name}' en {DIR_BASE}")
+if not RUTA_MODELO.exists():
+    raise FileNotFoundError(f"No se encontró '{RUTA_MODELO.name}' en {DIR_BASE}")
 
 df_vehiculos = pd.read_excel(RUTA_VEHICULOS)
 df_vehiculos.columns = [str(c).strip() for c in df_vehiculos.columns]
@@ -48,7 +82,7 @@ if "anio" in df_vehiculos.columns:
 
 modelo_mlp = tf.keras.models.load_model(RUTA_MODELO)
 
-app = FastAPI(title="API Tarifas Viajes Compartidos UTR", version="1.0.0")
+app = FastAPI(title="API Tarifas Viajes Compartidos UTR", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -70,81 +104,50 @@ class SolicitudCotizacion(BaseModel):
 
 
 class RespuestaCotizacion(BaseModel):
-    marca: str
-    modelo: str
-    anio: Optional[int]
-    rendimiento_km_l: float
-    recargo_trafico: float
-    franja_trafico: str
-    tarifa_continua: float
     tarifa_mxn: int
 
 
-def obtener_recargo(hora_str: str) -> tuple[float, str]:
+def obtener_recargo(hora_str: str) -> float:
     try:
         t = datetime.strptime(hora_str.strip(), "%H:%M")
     except ValueError:
         raise HTTPException(status_code=400, detail="Formato de hora inválido. Usa HH:MM (ej. 08:15).")
 
     mins = t.hour * 60 + t.minute
-    for ini, fin, rec, desc in FRANJAS_TRAFICO:
+    for ini, fin, rec in FRANJAS_TRAFICO:
         if ini <= mins <= fin:
-            return rec, desc
+            return rec
     raise HTTPException(
         status_code=400,
         detail=f"La hora '{hora_str}' está fuera del horario de operación UTR (05:00 a 18:30).",
     )
 
 
-def buscar_rendimiento(marca: str, modelo: str, anio: Optional[int]) -> tuple[str, str, Optional[int], float]:
+def buscar_rendimiento(marca: str, modelo: str, anio: Optional[int]) -> float:
     m_norm = marca.strip().lower()
     mod_norm = modelo.strip().lower()
 
     sub = df_vehiculos[(df_vehiculos["marca_norm"] == m_norm) & (df_vehiculos["modelo_norm"] == mod_norm)]
     if sub.empty:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No se encontró el vehículo '{marca} {modelo}' en el catálogo UTR.",
-        )
+        return RENDIMIENTO_PROMEDIO_DEFAULT
 
-    anio_resuelto = anio
     if anio is not None and "anio" in sub.columns:
         sub_anio = sub[sub["anio"] == anio]
         if not sub_anio.empty:
             sub = sub_anio
-        else:
-            anio_resuelto = None
 
-    marca_real = str(sub["marca"].iloc[0]).strip()
-    modelo_real = str(sub["modelo"].iloc[0]).strip()
-    rendimiento = round(float(sub["rendimiento_km_l"].mean()), 2)
-    return marca_real, modelo_real, anio_resuelto, rendimiento
+    return round(float(sub["rendimiento_km_l"].mean()), 2)
 
 
 @app.get("/")
 def health_check():
-    return {"status": "ok", "servicio": "API Tarifas UTR", "vehiculos_cargados": len(df_vehiculos)}
-
-
-@app.get("/vehiculos/marcas")
-def listar_marcas():
-    return {"marcas": sorted(df_vehiculos["marca"].unique(), key=str.lower)}
-
-
-@app.get("/vehiculos/{marca}/modelos")
-def listar_modelos(marca: str):
-    sub = df_vehiculos[df_vehiculos["marca_norm"] == marca.strip().lower()]
-    if sub.empty:
-        raise HTTPException(status_code=404, detail=f"Marca '{marca}' no encontrada.")
-    return {"marca": str(sub["marca"].iloc[0]), "modelos": sorted(sub["modelo"].unique(), key=str.lower)}
+    return {"status": "ok"}
 
 
 @app.post("/cotizar", response_model=RespuestaCotizacion)
 def cotizar_viaje(datos: SolicitudCotizacion):
-    marca_real, modelo_real, anio_resuelto, rendimiento = buscar_rendimiento(
-        datos.marca, datos.modelo, datos.anio
-    )
-    recargo, desc_trafico = obtener_recargo(datos.hora)
+    rendimiento = buscar_rendimiento(datos.marca, datos.modelo, datos.anio)
+    recargo = obtener_recargo(datos.hora)
 
     x = np.array(
         [
@@ -156,17 +159,8 @@ def cotizar_viaje(datos: SolicitudCotizacion):
         ],
         dtype=np.float64,
     )
-    pcs = ((x - MEDIA_PCA) / DESV_PCA) @ W_PCA
+    pcs = np.round(INTERCEPTO_PCA + x @ MATRIZ_PCA, 4)
     pred = float(modelo_mlp.predict(pcs.reshape(1, -1).astype(np.float32), verbose=0)[0, 0])
     tarifa_mxn = max(1, int(np.rint(pred)))
 
-    return RespuestaCotizacion(
-        marca=marca_real,
-        modelo=modelo_real,
-        anio=anio_resuelto,
-        rendimiento_km_l=rendimiento,
-        recargo_trafico=recargo,
-        franja_trafico=desc_trafico,
-        tarifa_continua=round(pred, 2),
-        tarifa_mxn=tarifa_mxn,
-    )
+    return RespuestaCotizacion(tarifa_mxn=tarifa_mxn)
